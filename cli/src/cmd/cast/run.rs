@@ -1,6 +1,6 @@
 use crate::{cmd::Cmd, init_progress, update_progress, utils::consume_config_rpc_url};
 use cast::{
-    revm::TransactTo,
+    revm::{TransactTo,SpecId},
     trace::{identifier::SignaturesIdentifier, CallTraceDecoder},
 };
 use clap::Parser;
@@ -100,6 +100,7 @@ impl RunArgs {
 
             let mut env = executor.env().clone();
             env.block.number = tx_block_number.into();
+            env.cfg.spec_id = SpecId::FRONTIER;
 
             let block = provider.get_block_with_txs(tx_block_number).await?;
             if let Some(ref block) = block {
