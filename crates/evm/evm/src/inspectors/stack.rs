@@ -5,7 +5,7 @@ use super::{
 use alloy_evm::{Evm, eth::EthEvmContext};
 use alloy_primitives::{
     Address, Bytes, Log, TxKind, U256,
-    map::{AddressHashMap, HashMap},
+    map::{AddressHashMap, AddressMap},
 };
 use foundry_cheatcodes::{CheatcodeAnalysis, CheatcodesExecutor, Wallets};
 use foundry_common::compile::Analysis;
@@ -59,6 +59,9 @@ pub struct InspectorStackBuilder {
     /// Whether to enable tracing and revert diagnostics.
     pub trace_mode: TraceMode,
     /// Whether logs should be collected.
+    /// - None for no log collection.
+    /// - Some(true) for realtime console.log-ing.
+    /// - Some(false) for log collection.
     pub logs: Option<bool>,
     /// Whether line coverage info should be collected.
     pub line_coverage: Option<bool>,
@@ -134,10 +137,10 @@ impl InspectorStackBuilder {
         self
     }
 
-    /// Set whether to collect logs.
+    /// Set the log collector, and whether to print the logs directly to stdout.
     #[inline]
-    pub fn logs(mut self, yes: bool) -> Self {
-        self.logs = Some(yes);
+    pub fn logs(mut self, live_logs: bool) -> Self {
+        self.logs = Some(live_logs);
         self
     }
 
@@ -228,7 +231,7 @@ impl InspectorStackBuilder {
             stack.set_chisel(chisel_state);
         }
         stack.collect_line_coverage(line_coverage.unwrap_or(false));
-        stack.collect_logs(logs.unwrap_or(true));
+        stack.collect_logs(logs);
         stack.print(print.unwrap_or(false));
         stack.tracing(trace_mode);
 
@@ -345,7 +348,7 @@ pub struct InspectorStackInner {
     /// Flag marking if we are in the inner EVM context.
     pub in_inner_context: bool,
     pub inner_context_data: Option<InnerContextData>,
-    pub top_frame_journal: HashMap<Address, Account>,
+    pub top_frame_journal: AddressMap<Account>,
     /// Address that reverted the call, if any.
     pub reverter: Option<Address>,
 }
@@ -479,9 +482,18 @@ impl InspectorStack {
     }
 
     /// Set whether to enable the log collector.
+    /// - None for no log collection.
+    /// - Some(true) for realtime console.log-ing.
+    /// - Some(false) for log collection.
     #[inline]
-    pub fn collect_logs(&mut self, yes: bool) {
-        self.log_collector = yes.then(Default::default);
+    pub fn collect_logs(&mut self, live_logs: Option<bool>) {
+        self.log_collector = live_logs.map(|live_logs| {
+            Box::new(if live_logs {
+                LogCollector::LiveLogs
+            } else {
+                LogCollector::Capture { logs: Vec::new() }
+            })
+        });
     }
 
     /// Set whether to enable the trace printer.
@@ -556,7 +568,7 @@ impl InspectorStack {
         });
 
         InspectorData {
-            logs: log_collector.map(|logs| logs.logs).unwrap_or_default(),
+            logs: log_collector.and_then(|logs| logs.into_captured_logs()).unwrap_or_default(),
             labels: cheatcodes
                 .as_ref()
                 .map(|cheatcodes| cheatcodes.labels.clone())
@@ -751,21 +763,21 @@ impl InspectorStackRefMut<'_> {
         }
 
         let (result, address, output) = match res.result {
-            ExecutionResult::Success { reason, gas_used, gas_refunded, logs: _, output } => {
-                gas.set_refund(gas_refunded as i64);
-                let _ = gas.record_cost(gas_used);
+            ExecutionResult::Success { reason, gas: result_gas, logs: _, output } => {
+                gas.set_refund(result_gas.inner_refunded() as i64);
+                let _ = gas.record_cost(result_gas.used());
                 let address = match output {
                     Output::Create(_, address) => address,
                     Output::Call(_) => None,
                 };
                 (reason.into(), address, output.into_data())
             }
-            ExecutionResult::Halt { reason, gas_used } => {
-                let _ = gas.record_cost(gas_used);
+            ExecutionResult::Halt { reason, gas: result_gas } => {
+                let _ = gas.record_cost(result_gas.used());
                 (reason.into(), None, Bytes::new())
             }
-            ExecutionResult::Revert { gas_used, output } => {
-                let _ = gas.record_cost(gas_used);
+            ExecutionResult::Revert { gas: result_gas, output } => {
+                let _ = gas.record_cost(result_gas.used());
                 (InstructionResult::Revert, None, output)
             }
         };
@@ -963,7 +975,7 @@ impl Inspector<EthEvmContext<&mut dyn DatabaseExt>> for InspectorStackRefMut<'_>
 
         if let Some(cheatcodes) = self.cheatcodes.as_deref_mut() {
             // Handle mocked functions, replace bytecode address with mock if matched.
-            if let Some(mocks) = cheatcodes.mocked_functions.get(&call.target_address) {
+            if let Some(mocks) = cheatcodes.mocked_functions.get(&call.bytecode_address) {
                 let input_bytes = call.input.bytes(ecx);
                 // Check if any mock function set for call data or if catch-all mock function set
                 // for selector.
@@ -1069,7 +1081,7 @@ impl Inspector<EthEvmContext<&mut dyn DatabaseExt>> for InspectorStackRefMut<'_>
             |inspector| inspector.create(ecx, create).map(Some),
         );
 
-        if !matches!(create.scheme, CreateScheme::Create2 { .. })
+        if !matches!(create.scheme(), CreateScheme::Create2 { .. })
             && self.enable_isolation
             && !self.in_inner_context
             && ecx.journaled_state.depth == 1
@@ -1077,10 +1089,10 @@ impl Inspector<EthEvmContext<&mut dyn DatabaseExt>> for InspectorStackRefMut<'_>
             let (result, address) = self.transact_inner(
                 ecx,
                 TxKind::Create,
-                create.caller,
-                create.init_code.clone(),
-                create.gas_limit,
-                create.value,
+                create.caller(),
+                create.init_code().clone(),
+                create.gas_limit(),
+                create.value(),
             );
             return Some(CreateOutcome { result, address });
         }

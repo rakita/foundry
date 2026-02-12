@@ -7,7 +7,11 @@ use std::{
 };
 
 use alloy_consensus::{BlockBody, Header};
-use alloy_primitives::{Address, B256, Bytes, U256, keccak256, map::HashMap};
+use alloy_eips::eip4895::Withdrawals;
+use alloy_primitives::{
+    Address, B256, Bytes, U256, keccak256,
+    map::{AddressHashMap, AddressMap},
+};
 use alloy_rpc_types::BlockId;
 use anvil_core::eth::{
     block::Block,
@@ -37,7 +41,7 @@ use crate::mem::storage::MinedTransaction;
 
 /// Helper trait get access to the full state data of the database
 pub trait MaybeFullDatabase: DatabaseRef<Error = DatabaseError> + Debug {
-    fn maybe_as_full_db(&self) -> Option<&HashMap<Address, DbAccount>> {
+    fn maybe_as_full_db(&self) -> Option<&AddressMap<DbAccount>> {
         None
     }
 
@@ -60,7 +64,7 @@ impl<'a, T: 'a + MaybeFullDatabase + ?Sized> MaybeFullDatabase for &'a T
 where
     &'a T: DatabaseRef<Error = DatabaseError>,
 {
-    fn maybe_as_full_db(&self) -> Option<&HashMap<Address, DbAccount>> {
+    fn maybe_as_full_db(&self) -> Option<&AddressMap<DbAccount>> {
         T::maybe_as_full_db(self)
     }
 
@@ -168,6 +172,7 @@ pub trait Db:
                         Some(Bytecode::new_raw(alloy_primitives::Bytes(account.code.0)))
                     },
                     nonce,
+                    account_id: None,
                 },
             );
 
@@ -237,14 +242,14 @@ impl<T: DatabaseRef<Error = DatabaseError> + Send + Sync + Clone + fmt::Debug> D
 }
 
 impl<T: DatabaseRef<Error = DatabaseError> + Debug> MaybeFullDatabase for CacheDB<T> {
-    fn maybe_as_full_db(&self) -> Option<&HashMap<Address, DbAccount>> {
+    fn maybe_as_full_db(&self) -> Option<&AddressMap<DbAccount>> {
         Some(&self.cache.accounts)
     }
 
     fn clear_into_state_snapshot(&mut self) -> StateSnapshot {
         let db_accounts = std::mem::take(&mut self.cache.accounts);
-        let mut accounts = HashMap::default();
-        let mut account_storage = HashMap::default();
+        let mut accounts = AddressHashMap::default();
+        let mut account_storage = AddressHashMap::default();
 
         for (addr, mut acc) in db_accounts {
             account_storage.insert(addr, std::mem::take(&mut acc.storage));
@@ -257,8 +262,8 @@ impl<T: DatabaseRef<Error = DatabaseError> + Debug> MaybeFullDatabase for CacheD
     }
 
     fn read_as_state_snapshot(&self) -> StateSnapshot {
-        let mut accounts = HashMap::default();
-        let mut account_storage = HashMap::default();
+        let mut accounts = AddressHashMap::default();
+        let mut account_storage = AddressHashMap::default();
 
         for (addr, acc) in &self.cache.accounts {
             account_storage.insert(*addr, acc.storage.clone());
@@ -345,7 +350,7 @@ impl DatabaseRef for StateDb {
 }
 
 impl MaybeFullDatabase for StateDb {
-    fn maybe_as_full_db(&self) -> Option<&HashMap<Address, DbAccount>> {
+    fn maybe_as_full_db(&self) -> Option<&AddressMap<DbAccount>> {
         self.0.maybe_as_full_db()
     }
 
@@ -431,6 +436,7 @@ impl TryFrom<LegacyBlockEnv> for BlockEnv {
                 .or_else(|| {
                     Some(BlobExcessGasAndPrice::new(0, BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE))
                 }),
+            slot_num: 0,
         })
     }
 }
@@ -579,6 +585,8 @@ pub struct SerializableBlock {
     pub header: Header,
     pub transactions: Vec<SerializableTransactionType>,
     pub ommers: Vec<Header>,
+    #[serde(default)]
+    pub withdrawals: Option<Withdrawals>,
 }
 
 impl From<Block> for SerializableBlock {
@@ -587,6 +595,7 @@ impl From<Block> for SerializableBlock {
             header: block.header,
             transactions: block.body.transactions.into_iter().map(Into::into).collect(),
             ommers: block.body.ommers.into_iter().collect(),
+            withdrawals: block.body.withdrawals,
         }
     }
 }
@@ -595,7 +604,7 @@ impl From<SerializableBlock> for Block {
     fn from(block: SerializableBlock) -> Self {
         let transactions = block.transactions.into_iter().map(Into::into).collect();
         let ommers = block.ommers;
-        let body = BlockBody { transactions, ommers, withdrawals: None };
+        let body = BlockBody { transactions, ommers, withdrawals: block.withdrawals };
         Self::new(block.header, body)
     }
 }
@@ -713,5 +722,37 @@ mod test {
         "#;
 
         let _block: SerializableBlock = serde_json::from_str(block).unwrap();
+    }
+
+    #[test]
+    fn test_block_withdrawals_preserved() {
+        use alloy_eips::eip4895::Withdrawal;
+
+        // create a block with withdrawals (like post-Shanghai blocks)
+        let withdrawal = Withdrawal {
+            index: 42,
+            validator_index: 123,
+            address: Address::repeat_byte(1),
+            amount: 1000,
+        };
+
+        let header = Header::default();
+        let body = BlockBody {
+            transactions: vec![],
+            ommers: vec![],
+            withdrawals: Some(vec![withdrawal].into()),
+        };
+        let block = Block::new(header, body);
+
+        // convert to SerializableBlock and back
+        let serializable = SerializableBlock::from(block);
+        let restored = Block::from(serializable);
+
+        // withdrawals should be preserved
+        assert!(restored.body.withdrawals.is_some());
+        let withdrawals = restored.body.withdrawals.unwrap();
+        assert_eq!(withdrawals.len(), 1);
+        assert_eq!(withdrawals[0].index, 42);
+        assert_eq!(withdrawals[0].validator_index, 123);
     }
 }

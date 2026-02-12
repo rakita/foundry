@@ -2,7 +2,7 @@ use crate::{
     Env,
     executors::{Executor, ExecutorBuilder},
 };
-use alloy_primitives::{Address, U256, map::HashMap};
+use alloy_primitives::{Address, U256, map::U256Map};
 use alloy_rpc_types::state::StateOverride;
 use eyre::Context;
 use foundry_compilers::artifacts::EvmVersion;
@@ -29,8 +29,8 @@ impl TracingExecutor {
         state_overrides: Option<StateOverride>,
     ) -> eyre::Result<Self> {
         let db = Backend::spawn(Some(fork))?;
-        // configures a bare version of the evm executor: no cheatcode inspector is enabled,
-        // tracing will be enabled only for the targeted transaction
+        // configures a bare version of the evm executor: no cheatcode and log_collector inspector
+        // is enabled, tracing will be enabled only for the targeted transaction
         let mut executor = ExecutorBuilder::new()
             .inspectors(|stack| {
                 stack.trace_mode(trace_mode).networks(networks).create2_deployer(create2_deployer)
@@ -53,7 +53,7 @@ impl TracingExecutor {
                     executor.set_code(address, bytecode)?;
                 }
                 if let Some(state) = overrides.state {
-                    let state: HashMap<U256, U256> = state
+                    let state: U256Map<U256> = state
                         .into_iter()
                         .map(|(slot, value)| (slot.into(), value.into()))
                         .collect();
